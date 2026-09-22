@@ -1,0 +1,45 @@
+# Python bytecode and tooling caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local editor state
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+.token
+token
+token.txt
+bot.token.txt
+cookies.txt
+
+# PermBot runtime state and generated output
+data/*.json
+data/*.tmp_*
+backups/
+.backups/
+art_cache/
+*.log
+patch.json
+
+# Local media libraries (large/user-owned files)
+music/
+songs/
+audio/
+library/
+local_music/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
