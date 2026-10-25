@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from cogs.music import (
     Music,
@@ -52,6 +52,17 @@ class MusicChoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(choices), 2)
         self.assertEqual([choice.title for choice in choices], ["Believer", "Believer (Live)"])
         self.assertTrue(all(choice.is_local for choice in choices))
+
+    async def test_ensure_voice_supports_library_cogs_call_signature(self):
+        voice = SimpleNamespace(channel=object())
+        target_channel = SimpleNamespace(connect=AsyncMock(return_value=voice))
+        member = SimpleNamespace(voice=SimpleNamespace(channel=target_channel))
+        guild = SimpleNamespace(voice_client=None)
+
+        connected = await self.music.ensure_voice(guild, member)
+
+        self.assertIs(connected, voice)
+        target_channel.connect.assert_awaited_once_with()
 
     def test_online_fallback_includes_youtube_and_soundcloud(self):
         choices = self.music.build_track_choices(

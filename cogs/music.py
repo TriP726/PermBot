@@ -813,6 +813,24 @@ class Music(commands.Cog):
                 await asyncio.sleep(0.5)
                 await self.play_next(guild)
 
+    async def ensure_voice(
+        self,
+        guild: discord.Guild,
+        member: discord.Member
+    ) -> discord.VoiceClient:
+        """Compatibility helper for cogs that connect with (guild, member)."""
+        member_voice = getattr(member, "voice", None)
+        target_channel = getattr(member_voice, "channel", None)
+        if not guild or not target_channel:
+            raise commands.CommandError("Join a voice channel before starting music.")
+
+        voice = guild.voice_client
+        if not voice:
+            voice = await target_channel.connect()
+        elif voice.channel != target_channel:
+            await voice.move_to(target_channel)
+        return voice
+
     async def ensure_voice_connection(self, ctx: commands.Context) -> Optional[discord.VoiceClient]:
         author_voice = getattr(ctx.author, "voice", None)
         if not ctx.guild or not author_voice or not author_voice.channel:
