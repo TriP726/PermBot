@@ -1,20 +1,29 @@
 """
 cogs/music.py - PermBot Music Playback & Audio Management
-Sticky Always-On-Top Dashboard Engine, Local-First Search, and Hybrid Music Controls
+Sticky Always-On-Top Dashboard Engine, Local-First Search, Track Disambiguation,
+and Hybrid Music Controls.
 """
 
 import os
 import random
 import asyncio
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 import yt_dlp
 import discord
 from discord import app_commands
 from discord.ext import commands
 from typing import Optional, List, Dict, Any
 
-from utils.audio import create_audio_source, EQ_PRESETS, EQ_DESCRIPTIONS
-from cogs.player_state import Song, GuildPlayer, PlayerView, get_guild_player, guild_players
+from utils.audio import create_audio_source
+from cogs.player_state import Song, PlayerView, get_guild_player
 from cogs.library import get_local_music_files
+
+ONLINE_SEARCH_COUNT = 10
+MAX_LOCAL_CHOICES = 10
+MAX_TRACK_CHOICES = 20
+LOCAL_MATCH_THRESHOLD = 0.50
+TRACK_CHOICE_TIMEOUT = 60.0
 
 YTDL_OPTIONS = {
     "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
@@ -32,7 +41,174 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
 }
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+# Flat searches return lightweight metadata only. The chosen result is resolved
+# to a playable stream URL afterwards, avoiding ten expensive extractions.
+SEARCH_YTDL_OPTIONS = {
+    **YTDL_OPTIONS,
+    "extract_flat": "in_playlist",
+    "skip_download": True,
+    "noplaylist": False,
+    "ignoreerrors": True,
+    "playlistend": ONLINE_SEARCH_COUNT,
+    "socket_timeout": 10,
+    "retries": 1,
+}
+
+
+def truncate_text(value: Any, max_length: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_length:
+        return text
+    if max_length <= 1:
+        return text[:max_length]
+    return text[:max_length - 1] + "…"
+
+
+def safe_display_text(value: Any, max_length: int = 100) -> str:
+    text = truncate_text(" ".join(str(value or "").split()), max_length)
+    text = discord.utils.escape_mentions(text)
+    text = discord.utils.escape_markdown(text, ignore_links=False)
+    return truncate_text(text, max_length)
+
+
+def safe_duration(value: Any) -> int:
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def normalize_match_text(value: Any) -> str:
+    raw = str(value or "").lower()
+    return " ".join("".join(char if char.isalnum() else " " for char in raw).split())
+
+
+def match_score(query: str, *candidates: Any) -> float:
+    """Return a tolerant 0..1 score for similar song/file names."""
+    normalized_query = normalize_match_text(query)
+    if not normalized_query:
+        return 0.0
+
+    query_words = set(normalized_query.split())
+    best_score = 0.0
+    for candidate in candidates:
+        normalized_candidate = normalize_match_text(candidate)
+        if not normalized_candidate:
+            continue
+        if normalized_query == normalized_candidate:
+            return 1.0
+
+        score = SequenceMatcher(None, normalized_query, normalized_candidate).ratio()
+        if query_words:
+            candidate_words = set(normalized_candidate.split())
+            word_overlap = len(query_words & candidate_words) / len(query_words)
+            score = max(score, word_overlap * 0.9)
+        if len(normalized_query) >= 3 and normalized_query in normalized_candidate:
+            score = max(score, 0.9)
+        if len(normalized_candidate) >= 3 and normalized_candidate in normalized_query:
+            score = max(score, 0.9)
+        best_score = max(best_score, score)
+    return best_score
+
+
+def online_entry_url(entry: Dict[str, Any]) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    url = entry.get("webpage_url") or entry.get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        return url
+    video_id = entry.get("id")
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return ""
+
+
+def extract_ytdl_info(query: str, flat: bool = False) -> Optional[Dict[str, Any]]:
+    options = dict(SEARCH_YTDL_OPTIONS if flat else YTDL_OPTIONS)
+    with yt_dlp.YoutubeDL(options) as downloader:
+        return downloader.extract_info(query, download=False)
+
+
+def first_track_data(data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    if "entries" in data:
+        for entry in data.get("entries") or []:
+            if isinstance(entry, dict):
+                return entry
+        return None
+    return data
+
+
+@dataclass
+class TrackChoice:
+    title: str
+    artist: str
+    duration: int
+    is_local: bool
+    local_path: Optional[str] = None
+    webpage_url: str = ""
+    score: float = 0.0
+
+    @property
+    def source_label(self) -> str:
+        return "📁 Local" if self.is_local else "🌐 YouTube"
+
+
+class TrackChoiceSelect(discord.ui.Select):
+    def __init__(self, choices: List[TrackChoice], music_cog: "Music"):
+        self.choices = choices
+        self.music_cog = music_cog
+        options: List[discord.SelectOption] = []
+        for index, choice in enumerate(choices, start=1):
+            duration = self.music_cog.format_time(choice.duration) if choice.duration > 0 else "--:--"
+            options.append(discord.SelectOption(
+                label=truncate_text(f"{index}. {choice.title}", 100),
+                description=truncate_text(f"{choice.source_label} • {choice.artist} • [{duration}]", 100),
+                value=str(index - 1),
+                emoji="🎵"
+            ))
+        super().__init__(
+            placeholder="🎶 Choose the track you meant...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, TrackChoiceView):
+            return await interaction.response.send_message("This selection is no longer active.", ephemeral=True)
+        if interaction.user.id != view.requester_id:
+            return await interaction.response.send_message(
+                "Only the person who started this search can choose a track.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer()
+        view.selected_index = int(self.values[0])
+        view.stop()
+
+
+class TrackChoiceView(discord.ui.View):
+    def __init__(self, music_cog: "Music", requester_id: int, choices: List[TrackChoice]):
+        super().__init__(timeout=TRACK_CHOICE_TIMEOUT)
+        self.requester_id = requester_id
+        self.selected_index: Optional[int] = None
+        self.cancelled = False
+        self.add_item(TrackChoiceSelect(choices, music_cog))
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            return await interaction.response.send_message(
+                "Only the person who started this search can cancel it.",
+                ephemeral=True
+            )
+        await interaction.response.defer()
+        self.cancelled = True
+        self.stop()
 
 
 class Music(commands.Cog):
@@ -69,54 +245,349 @@ class Music(commands.Cog):
         except Exception:
             pass
 
-    async def resolve_track(self, query: str, requester: discord.Member) -> Optional[Song]:
-        clean_query = query.strip()
-        is_url = clean_query.startswith("http://") or clean_query.startswith("https://")
+    @staticmethod
+    def _is_url(query: str) -> bool:
+        return query.startswith(("http://", "https://"))
 
-        # Local search first
-        if not is_url:
-            local_matches = get_local_music_files(filter_query=clean_query)
-            if local_matches:
-                best_match = local_matches[0]
-                for f in local_matches:
-                    title = str(f.get("title", "")).lower()
-                    fname = os.path.splitext(os.path.basename(f["path"]))[0].lower()
-                    if clean_query.lower() in (title, fname):
-                        best_match = f
-                        break
+    @staticmethod
+    def _get_local_track_fields(meta: Dict[str, Any]) -> tuple[str, str, str]:
+        path = str(meta.get("path") or "")
+        filename = os.path.splitext(os.path.basename(path))[0]
+        title = str(meta.get("title") or filename or "Unknown Title")
+        artist = str(meta.get("artist") or "Local Music")
+        return title, artist, filename
 
-                song_data = {
-                    "title": best_match.get("title", os.path.splitext(os.path.basename(best_match["path"]))[0]),
-                    "artist": best_match.get("artist", "Local Music"),
-                    "duration": best_match.get("duration", 0),
-                    "url": "",
-                    "webpage_url": "",
-                    "thumbnail": None,
-                    "is_local": True,
-                    "local_path": best_match["path"]
-                }
-                return Song(song_data, requester)
-
-        # Fallback to online stream
-        loop = self.bot.loop or asyncio.get_event_loop()
+    @staticmethod
+    def _search_local_matches(query: str) -> List[Dict[str, Any]]:
         try:
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(clean_query, download=False))
+            library_files = get_local_music_files()
         except Exception as e:
-            print(f"[Extract Error] {e}")
-            return None
+            print(f"[Local Search Error] {e}")
+            return []
 
-        if not data:
-            return None
+        scored_matches = []
+        for meta in library_files:
+            if not isinstance(meta, dict):
+                continue
+            path = str(meta.get("path") or "")
+            if not path:
+                continue
+            title, artist, filename = Music._get_local_track_fields(meta)
+            score = match_score(query, title, filename, artist, f"{artist} {title}")
+            if score >= LOCAL_MATCH_THRESHOLD:
+                scored_matches.append((score, title.lower(), path.lower(), meta))
 
+        scored_matches.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return [item[3] for item in scored_matches[:MAX_LOCAL_CHOICES * 2]]
+
+    @staticmethod
+    def _search_online_entries(query: str) -> List[Dict[str, Any]]:
+        try:
+            data = extract_ytdl_info(f"ytsearch{ONLINE_SEARCH_COUNT}:{query}", True)
+        except Exception as e:
+            print(f"[Online Search Error] {e}")
+            return []
+
+        if not isinstance(data, dict):
+            return []
         if "entries" in data:
-            entries = [e for e in data["entries"] if e]
-            if not entries:
-                return None
-            track_data = entries[0]
+            raw_entries = list(data.get("entries") or [])
         else:
-            track_data = data
+            raw_entries = [data]
+        return [entry for entry in raw_entries if isinstance(entry, dict)][:ONLINE_SEARCH_COUNT]
 
+    def build_track_choices(
+        self,
+        query: str,
+        local_matches: List[Dict[str, Any]],
+        online_entries: List[Dict[str, Any]]
+    ) -> List[TrackChoice]:
+        local_choices: List[TrackChoice] = []
+        seen_paths = set()
+        for meta in local_matches:
+            if not isinstance(meta, dict):
+                continue
+            path = str(meta.get("path") or "")
+            if not path or path in seen_paths:
+                continue
+            title, artist, filename = self._get_local_track_fields(meta)
+            score = match_score(query, title, filename, artist, f"{artist} {title}")
+            local_choices.append(TrackChoice(
+                title=title,
+                artist=artist,
+                duration=safe_duration(meta.get("duration")),
+                is_local=True,
+                local_path=path,
+                score=score
+            ))
+            seen_paths.add(path)
+
+        local_choices.sort(key=lambda choice: (-choice.score, choice.title.lower(), choice.local_path or ""))
+
+        online_choices: List[TrackChoice] = []
+        seen_urls = set()
+        for entry in online_entries:
+            url = online_entry_url(entry)
+            if not url or url in seen_urls:
+                continue
+            title = str(entry.get("title") or entry.get("name") or "Unknown Title")
+            artist = str(entry.get("artist") or entry.get("uploader") or entry.get("channel") or "Unknown Artist")
+            online_choices.append(TrackChoice(
+                title=title,
+                artist=artist,
+                duration=safe_duration(entry.get("duration")),
+                is_local=False,
+                webpage_url=url,
+                score=match_score(query, title, f"{artist} {title}")
+            ))
+            seen_urls.add(url)
+
+        return (local_choices[:MAX_LOCAL_CHOICES] + online_choices[:ONLINE_SEARCH_COUNT])[:MAX_TRACK_CHOICES]
+
+    async def find_track_choices(self, query: str) -> List[TrackChoice]:
+        clean_query = query.strip()
+        results = await asyncio.gather(
+            asyncio.to_thread(self._search_local_matches, clean_query),
+            asyncio.to_thread(self._search_online_entries, clean_query),
+            return_exceptions=True
+        )
+        local_matches = results[0] if not isinstance(results[0], Exception) else []
+        online_entries = results[1] if not isinstance(results[1], Exception) else []
+        if isinstance(results[0], Exception):
+            print(f"[Local Search Task Error] {results[0]}")
+        if isinstance(results[1], Exception):
+            print(f"[Online Search Task Error] {results[1]}")
+        return self.build_track_choices(clean_query, local_matches, online_entries)
+
+    @staticmethod
+    def _song_from_extracted_data(
+        data: Any,
+        requester: discord.Member,
+        choice: Optional[TrackChoice] = None
+    ) -> Optional[Song]:
+        track_data = first_track_data(data)
+        if not isinstance(track_data, dict):
+            return None
+
+        track_data = dict(track_data)
+        if choice:
+            track_data["title"] = track_data.get("title") or choice.title
+            track_data["artist"] = track_data.get("artist") or track_data.get("uploader") or choice.artist
+            track_data["duration"] = safe_duration(track_data.get("duration") or choice.duration)
+            track_data["webpage_url"] = track_data.get("webpage_url") or choice.webpage_url
+        if not track_data.get("url"):
+            return None
         return Song(track_data, requester)
+
+    async def build_song_from_choice(
+        self,
+        choice: TrackChoice,
+        requester: discord.Member
+    ) -> Optional[Song]:
+        if choice.is_local:
+            if not choice.local_path:
+                return None
+            return Song({
+                "title": choice.title,
+                "artist": choice.artist,
+                "duration": choice.duration,
+                "url": "",
+                "webpage_url": "",
+                "thumbnail": None,
+                "is_local": True,
+                "local_path": choice.local_path
+            }, requester)
+
+        if not choice.webpage_url:
+            return None
+        try:
+            data = await asyncio.to_thread(extract_ytdl_info, choice.webpage_url, False)
+        except Exception as e:
+            print(f"[Track Resolve Error] {e}")
+            return None
+        return self._song_from_extracted_data(data, requester, choice)
+
+    async def resolve_track(self, query: str, requester: discord.Member) -> Optional[Song]:
+        """Backwards-compatible first-match resolver; commands use the choice UI."""
+        clean_query = query.strip()
+        if self._is_url(clean_query):
+            try:
+                data = await asyncio.to_thread(extract_ytdl_info, clean_query, False)
+            except Exception as e:
+                print(f"[Extract Error] {e}")
+                return None
+            return self._song_from_extracted_data(data, requester)
+
+        choices = await self.find_track_choices(clean_query)
+        if not choices:
+            return None
+        return await self.build_song_from_choice(choices[0], requester)
+
+    def format_choice_line(self, index: int, choice: TrackChoice) -> str:
+        duration = self.format_time(choice.duration) if choice.duration > 0 else "--:--"
+        title = safe_display_text(choice.title, 80)
+        artist = safe_display_text(choice.artist, 40)
+        link_url = choice.webpage_url if choice.webpage_url and len(choice.webpage_url) <= 75 else ""
+        prefix = f"`{index:02d}.` "
+        suffix = f" — {artist} `[{duration}]` • {choice.source_label}"
+
+        max_line_length = 190
+        markup_overhead = len(link_url) + 4 if link_url else 0
+        title_budget = max(1, max_line_length - len(prefix) - len(suffix) - 4 - markup_overhead)
+        title = truncate_text(title, title_budget)
+        if link_url:
+            title = f"[{title}]({link_url})"
+        return f"{prefix}**{title}**{suffix}"
+
+    def build_choice_embed(
+        self,
+        query: str,
+        choices: List[TrackChoice],
+        requester: discord.Member
+    ) -> discord.Embed:
+        lines = [self.format_choice_line(index, choice) for index, choice in enumerate(choices, start=1)]
+        requester_name = safe_display_text(getattr(requester, "display_name", "requester"), 50)
+        embed = discord.Embed(
+            title=f"🔎 Multiple matches for '{safe_display_text(query, 120)}'",
+            description="\n".join(lines),
+            color=0x9B59B6
+        )
+        embed.add_field(
+            name="Choose one",
+            value=(
+                f"Use the dropdown below. Only **{requester_name}** can choose, "
+                f"and the menu expires after **{int(TRACK_CHOICE_TIMEOUT)} seconds**."
+            ),
+            inline=False
+        )
+        embed.set_footer(
+            text=f"Showing {len(choices)} closest local and YouTube matches. Use a more specific search to narrow the list."
+        )
+        return embed
+
+    @staticmethod
+    async def _edit_choice_message(message: Any, embed: discord.Embed) -> None:
+        if not message:
+            return
+        try:
+            await message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+    async def prompt_for_choice(
+        self,
+        ctx: commands.Context,
+        query: str,
+        choices: List[TrackChoice]
+    ) -> Optional[TrackChoice]:
+        view = TrackChoiceView(self, ctx.author.id, choices)
+        picker_message = await ctx.reply(embed=self.build_choice_embed(query, choices, ctx.author), view=view)
+        await view.wait()
+
+        valid_selection = view.selected_index is not None and 0 <= view.selected_index < len(choices)
+        if view.cancelled:
+            await self._edit_choice_message(
+                picker_message,
+                discord.Embed(
+                    title="🚫 Track selection cancelled",
+                    description="Run the command again whenever you want to choose a track.",
+                    color=0x2B2D31
+                )
+            )
+            return None
+        if not valid_selection:
+            await self._edit_choice_message(
+                picker_message,
+                discord.Embed(
+                    title="⌛ Track selection expired",
+                    description="Run the command again to see fresh results.",
+                    color=0x2B2D31
+                )
+            )
+            return None
+
+        selected = choices[view.selected_index]
+        await self._edit_choice_message(
+            picker_message,
+            discord.Embed(
+                title="✅ Track selected",
+                description=f"Loading **{safe_display_text(selected.title, 150)}** — {selected.source_label}...",
+                color=0x57F287
+            )
+        )
+        return selected
+
+    async def resolve_play_query(self, ctx: commands.Context, query: str) -> Optional[Song]:
+        clean_query = (query or "").strip()
+        if not clean_query:
+            await ctx.reply("❌ Please provide a song title, local filename, or URL.")
+            return None
+        if not ctx.guild:
+            await ctx.reply("❌ Music commands can only be used in a server.")
+            return None
+
+        author_voice = getattr(ctx.author, "voice", None)
+        if not author_voice or not author_voice.channel:
+            await ctx.reply("❌ You must be inside a voice channel to play music.")
+            return None
+
+        if self._is_url(clean_query):
+            song = await self.resolve_track(clean_query, ctx.author)
+            if not song:
+                await ctx.reply("❌ I couldn't load a playable track from that link.")
+            return song
+
+        try:
+            choices = await self.find_track_choices(clean_query)
+        except Exception as e:
+            print(f"[Track Search Error] {e}")
+            await ctx.reply("❌ I couldn't finish the music search. Please try again.")
+            return None
+
+        if not choices:
+            await ctx.reply(f"❌ No matching track found for **'{safe_display_text(clean_query, 150)}'**.")
+            return None
+
+        if len(choices) == 1:
+            song = await self.build_song_from_choice(choices[0], ctx.author)
+            if not song:
+                await ctx.reply("❌ I couldn't load the matching track. Please try another search.")
+            return song
+
+        selected = await self.prompt_for_choice(ctx, clean_query, choices)
+        if not selected:
+            return None
+
+        song = await self.build_song_from_choice(selected, ctx.author)
+        if not song:
+            await ctx.reply("❌ I couldn't load that track. Please try again or choose another result.")
+        return song
+
+    async def queue_song(self, ctx: commands.Context, song: Song, *, play_next: bool = False) -> None:
+        vc = await self.ensure_voice_connection(ctx)
+        if not vc:
+            return
+
+        player = get_guild_player(self.bot, ctx.guild.id)
+        player.text_channel = ctx.channel
+        title = safe_display_text(song.title, 150)
+        source_tag = "📁 Local" if song.is_local else "🌐 Web"
+
+        if play_next:
+            player.queue.insert(0, song)
+        else:
+            player.queue.append(song)
+
+        if not vc.is_playing() and not vc.is_paused():
+            await self.play_next(ctx.guild)
+            await ctx.reply(f"🎶 Now playing [{source_tag}]: **{title}**")
+            return
+
+        await self.update_dashboard(ctx.guild, force_repost=True)
+        if play_next:
+            await ctx.reply(f"⏭️ Queued to play next [{source_tag}]: **{title}** (Position: `#1` in queue)")
+        else:
+            await ctx.reply(f"📥 Added to queue [{source_tag}]: **{title}** (Position: `#{len(player.queue)}`)")
 
     async def update_dashboard(self, guild: discord.Guild, force_repost: bool = False):
         """Maintains sticky status at the bottom of the channel."""
@@ -308,11 +779,12 @@ class Music(commands.Cog):
                 await self.play_next(guild)
 
     async def ensure_voice_connection(self, ctx: commands.Context) -> Optional[discord.VoiceClient]:
-        if not ctx.author.voice or not ctx.author.voice.channel:
+        author_voice = getattr(ctx.author, "voice", None)
+        if not ctx.guild or not author_voice or not author_voice.channel:
             await ctx.reply("❌ You must be inside a voice channel to play music.")
             return None
 
-        target_vc = ctx.author.voice.channel
+        target_vc = author_voice.channel
         vc = ctx.guild.voice_client
 
         if not vc:
@@ -322,56 +794,23 @@ class Music(commands.Cog):
 
         return vc
 
-    @commands.hybrid_command(name="play", description="Play a song (searches local library first, then online).")
+    @commands.hybrid_command(name="play", description="Play a song, with options when your search has multiple matches.")
     @app_commands.describe(query="Song title, local filename, or URL")
     async def play(self, ctx: commands.Context, *, query: str):
         await ctx.defer()
-        vc = await self.ensure_voice_connection(ctx)
-        if not vc:
-            return
-
-        player = get_guild_player(self.bot, ctx.guild.id)
-        player.text_channel = ctx.channel
-
-        song = await self.resolve_track(query, ctx.author)
+        song = await self.resolve_play_query(ctx, query)
         if not song:
-            return await ctx.reply(f"❌ No matching track found for **'{query}'**.")
+            return
+        await self.queue_song(ctx, song)
 
-        player.queue.append(song)
-        source_tag = "📁 Local" if song.is_local else "🌐 Web"
-
-        if not vc.is_playing() and not vc.is_paused():
-            await self.play_next(ctx.guild)
-            await ctx.reply(f"🎶 Now playing [{source_tag}]: **{song.title}**")
-        else:
-            await self.update_dashboard(ctx.guild, force_repost=True)
-            await ctx.reply(f"📥 Added to queue [{source_tag}]: **{song.title}** (Position: `#{len(player.queue)}`)")
-
-    @commands.hybrid_command(name="playnext", aliases=["pn", "nextsong"], description="Queue a song to play immediately next after the current track.")
+    @commands.hybrid_command(name="playnext", aliases=["pn", "nextsong"], description="Queue a song next, with options when your search has multiple matches.")
     @app_commands.describe(query="Song title, local filename, or URL")
     async def playnext(self, ctx: commands.Context, *, query: str):
         await ctx.defer()
-        vc = await self.ensure_voice_connection(ctx)
-        if not vc:
-            return
-
-        player = get_guild_player(self.bot, ctx.guild.id)
-        player.text_channel = ctx.channel
-
-        song = await self.resolve_track(query, ctx.author)
+        song = await self.resolve_play_query(ctx, query)
         if not song:
-            return await ctx.reply(f"❌ No matching track found for **'{query}'**.")
-
-        source_tag = "📁 Local" if song.is_local else "🌐 Web"
-
-        if not vc.is_playing() and not vc.is_paused():
-            player.queue.insert(0, song)
-            await self.play_next(ctx.guild)
-            await ctx.reply(f"🎶 Now playing [{source_tag}]: **{song.title}**")
-        else:
-            player.queue.insert(0, song)
-            await self.update_dashboard(ctx.guild, force_repost=True)
-            await ctx.reply(f"⏭️ Queued to play next [{source_tag}]: **{song.title}** (Position: `#1` in queue)")
+            return
+        await self.queue_song(ctx, song, play_next=True)
 
     @commands.hybrid_command(name="shuffle", description="Shuffle current queue or all local tracks (!shuffle all).")
     @app_commands.describe(target="Leave empty to shuffle current queue, or type 'all' to shuffle local music")

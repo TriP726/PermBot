@@ -62,6 +62,10 @@ Place audio under any supported local library directory:
 
 PermBot searches these files before falling back to online extraction. Supported formats include MP3, FLAC, M4A, OGG, WAV, Opus, AAC, WMA, ALAC, and AIFF.
 
+### Choosing between similar tracks
+
+When `!play`, `/play`, `!playnext`, or `/playnext` finds multiple local or YouTube tracks with the same or a similar name, the bot shows a numbered list and a dropdown with the title, artist/channel, duration, and source. The requester picks the intended version; the menu also has a Cancel button and expires after 60 seconds. Direct links play immediately without the selection menu.
+
 To preview standardized filenames without changing anything:
 
 ```powershell
