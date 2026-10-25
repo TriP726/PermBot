@@ -186,16 +186,26 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0, custom_id="player_stop")
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        player = get_guild_player(self.bot, self.guild_id)
-        vc = interaction.guild.voice_client
-        player.queue.clear()
-        player.current = None
-        if vc:
-            vc.stop()
-            await vc.disconnect()
-        await self.bot.get_cog("Music").update_dashboard(interaction.guild, force_repost=False)
-        await self.bot.get_cog("Music").update_presence(None)
+        music_cog = self.bot.get_cog("Music")
+        guild = interaction.guild
+        if not music_cog or not guild:
+            await interaction.response.send_message("❌ Music playback is unavailable right now.", ephemeral=True)
+            return
+
+        stop_playback = getattr(music_cog, "stop_playback", None)
+        stop_guild_player = getattr(music_cog, "stop_guild_player", None)
+        if not callable(stop_playback) and not callable(stop_guild_player):
+            await interaction.response.send_message("❌ The music cog cannot stop playback right now.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        if callable(stop_playback):
+            await stop_playback(guild)
+        else:
+            await stop_guild_player(guild)
+            await music_cog.update_dashboard(guild)
+            await music_cog.update_presence(None)
+        await interaction.followup.send("⏹️ Playback stopped and disconnected.", ephemeral=True)
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1, custom_id="player_loop")
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):

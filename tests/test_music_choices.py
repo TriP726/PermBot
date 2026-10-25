@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from cogs.music import (
     Music,
@@ -9,6 +9,7 @@ from cogs.music import (
     match_score,
     online_entry_url,
 )
+from cogs.player_state import get_guild_player
 
 
 class MusicChoiceTests(unittest.IsolatedAsyncioTestCase):
@@ -63,6 +64,29 @@ class MusicChoiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(connected, voice)
         target_channel.connect.assert_awaited_once_with()
+
+    async def test_stop_playback_clears_state_stops_and_disconnects(self):
+        guild_id = 987654321
+        voice = SimpleNamespace(
+            is_playing=Mock(return_value=True),
+            is_paused=Mock(return_value=False),
+            is_connected=Mock(return_value=True),
+            stop=Mock(),
+            disconnect=AsyncMock(),
+        )
+        guild = SimpleNamespace(id=guild_id, voice_client=voice)
+        player = get_guild_player(None, guild_id)
+        player.queue[:] = [object(), object()]
+        player.current = object()
+        old_play_id = player.play_id
+
+        await self.music.stop_playback(guild)
+
+        self.assertEqual(player.queue, [])
+        self.assertIsNone(player.current)
+        self.assertEqual(player.play_id, old_play_id + 1)
+        voice.stop.assert_called_once_with()
+        voice.disconnect.assert_awaited_once_with(force=True)
 
     def test_online_fallback_includes_youtube_and_soundcloud(self):
         choices = self.music.build_track_choices(

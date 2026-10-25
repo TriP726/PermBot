@@ -953,17 +953,37 @@ class Music(commands.Cog):
         vc.stop()
         await ctx.reply("⏭️ Skipped track.")
 
+    async def stop_playback(self, guild: discord.Guild) -> None:
+        """Invalidate the active stream, clear the queue, and disconnect voice."""
+        player = get_guild_player(self.bot, guild.id)
+        voice = guild.voice_client
+
+        async with player._lock:
+            # Prevent the old FFmpeg after-callback from starting another queued song.
+            player.play_id += 1
+            player.queue.clear()
+            player.current = None
+            player.skip_requested = False
+            player.paused = False
+            player.pause_timestamp = 0.0
+            player.total_paused_duration = 0.0
+            player.start_timestamp = 0.0
+
+        if voice:
+            try:
+                if voice.is_playing() or voice.is_paused():
+                    voice.stop()
+                if voice.is_connected():
+                    await voice.disconnect(force=True)
+            except discord.DiscordException as e:
+                print(f"[Stop Playback Error] {e}")
+
+        await self.update_dashboard(guild, force_repost=False)
+        await self.update_presence(None)
+
     @commands.hybrid_command(name="stop", description="Stop playback and clear the queue.")
     async def stop(self, ctx: commands.Context):
-        player = get_guild_player(self.bot, ctx.guild.id)
-        vc = ctx.guild.voice_client
-        player.queue.clear()
-        player.current = None
-        if vc:
-            vc.stop()
-            await vc.disconnect()
-        await self.update_dashboard(ctx.guild, force_repost=False)
-        await self.update_presence(None)
+        await self.stop_playback(ctx.guild)
         await ctx.reply("⏹️ Playback stopped and disconnected.")
 
     @commands.hybrid_command(name="clear", description="Clear all tracks from the queue.")
