@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from cogs.music import (
     Music,
@@ -15,7 +16,7 @@ class MusicChoiceTests(unittest.IsolatedAsyncioTestCase):
         self.music = Music(None)
         self.requester = SimpleNamespace(id=1234, display_name="Test User")
 
-    def test_similar_local_and_online_tracks_are_presented_as_choices(self):
+    def test_local_matches_are_shown_without_online_results(self):
         local_matches = [
             {
                 "path": "music/Believer.mp3",
@@ -48,11 +49,71 @@ class MusicChoiceTests(unittest.IsolatedAsyncioTestCase):
 
         choices = self.music.build_track_choices("Believer", local_matches, online_matches)
 
-        self.assertEqual(len(choices), 4)
-        self.assertEqual(choices[0].title, "Believer")
+        self.assertEqual(len(choices), 2)
+        self.assertEqual([choice.title for choice in choices], ["Believer", "Believer (Live)"])
+        self.assertTrue(all(choice.is_local for choice in choices))
+
+    def test_online_fallback_includes_youtube_and_soundcloud(self):
+        choices = self.music.build_track_choices(
+            "Believer",
+            [],
+            [
+                {
+                    "id": "official123",
+                    "url": "official123",
+                    "title": "Believer (Official Music Video)",
+                    "channel": "Imagine Dragons",
+                    "duration": 214,
+                    "_search_source": "ytsearch",
+                },
+                {
+                    "webpage_url": "https://soundcloud.com/example/believer",
+                    "title": "Believer - Remix",
+                    "artist": "Example Artist",
+                    "duration": 210,
+                    "_search_source": "scsearch",
+                },
+            ],
+        )
+
+        self.assertEqual(len(choices), 2)
+        self.assertEqual(choices[0].source_label, "🌐 YouTube")
+        self.assertEqual(choices[0].webpage_url, "https://www.youtube.com/watch?v=official123")
+        self.assertEqual(choices[1].source_label, "🌐 SoundCloud")
+
+    async def test_local_results_skip_youtube_and_soundcloud_searches(self):
+        local = [{"path": "music/Believer.mp3", "title": "Believer", "artist": "Imagine Dragons"}]
+        with patch.object(Music, "_search_local_matches", return_value=local), patch.object(
+            Music, "_search_online_entries"
+        ) as online_search:
+            choices = await self.music.find_track_choices("Believer")
+
+        self.assertEqual([choice.title for choice in choices], ["Believer"])
         self.assertTrue(choices[0].is_local)
-        self.assertEqual(choices[2].webpage_url, "https://www.youtube.com/watch?v=official123")
-        self.assertEqual(choices[2].artist, "Imagine Dragons")
+        online_search.assert_not_called()
+
+    async def test_no_local_results_search_both_online_services(self):
+        youtube = [{
+            "id": "video123",
+            "title": "Example video",
+            "_search_source": "ytsearch",
+        }]
+        soundcloud = [{
+            "webpage_url": "https://soundcloud.com/artist/example",
+            "title": "Example track",
+            "_search_source": "scsearch",
+        }]
+
+        def search_online(query, source):
+            return youtube if source == "ytsearch" else soundcloud
+
+        with patch.object(Music, "_search_local_matches", return_value=[]), patch.object(
+            Music, "_search_online_entries", side_effect=search_online
+        ) as online_search:
+            choices = await self.music.find_track_choices("Example")
+
+        self.assertEqual(online_search.call_count, 2)
+        self.assertEqual([choice.source_label for choice in choices], ["🌐 YouTube", "🌐 SoundCloud"])
 
     def test_search_menu_respects_discord_component_limits(self):
         local_matches = [

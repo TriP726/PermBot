@@ -14,6 +14,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlsplit
 
 from utils.audio import create_audio_source
 from cogs.player_state import Song, PlayerView, get_guild_player
@@ -24,6 +25,7 @@ MAX_LOCAL_CHOICES = 10
 MAX_TRACK_CHOICES = 20
 LOCAL_MATCH_THRESHOLD = 0.50
 TRACK_CHOICE_TIMEOUT = 60.0
+ONLINE_MEDIA_DOMAINS = ("youtube.com", "youtu.be", "soundcloud.com", "sndcdn.com")
 
 YTDL_OPTIONS = {
     "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
@@ -111,14 +113,20 @@ def match_score(query: str, *candidates: Any) -> float:
     return best_score
 
 
-def online_entry_url(entry: Dict[str, Any]) -> str:
+def online_entry_url(entry: Dict[str, Any], search_source: str = "ytsearch") -> str:
     if not isinstance(entry, dict):
         return ""
-    url = entry.get("webpage_url") or entry.get("url")
-    if isinstance(url, str) and url.startswith(("http://", "https://")):
-        return url
+
+    for url in (entry.get("webpage_url"), entry.get("original_url"), entry.get("url")):
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        if any(host == domain or host.endswith(f".{domain}") for domain in ONLINE_MEDIA_DOMAINS):
+            return url
+
+    # YouTube flat search entries sometimes include only a video ID.
     video_id = entry.get("id")
-    if video_id:
+    if video_id and search_source == "ytsearch":
         return f"https://www.youtube.com/watch?v={video_id}"
     return ""
 
@@ -152,7 +160,10 @@ class TrackChoice:
 
     @property
     def source_label(self) -> str:
-        return "📁 Local" if self.is_local else "🌐 YouTube"
+        if self.is_local:
+            return "📁 Local"
+        host = (urlsplit(self.webpage_url).hostname or "").lower()
+        return "🌐 SoundCloud" if host.endswith(("soundcloud.com", "sndcdn.com")) else "🌐 YouTube"
 
 
 class TrackChoiceSelect(discord.ui.Select):
@@ -281,11 +292,11 @@ class Music(commands.Cog):
         return [item[3] for item in scored_matches[:MAX_LOCAL_CHOICES * 2]]
 
     @staticmethod
-    def _search_online_entries(query: str) -> List[Dict[str, Any]]:
+    def _search_online_entries(query: str, search_source: str = "ytsearch") -> List[Dict[str, Any]]:
         try:
-            data = extract_ytdl_info(f"ytsearch{ONLINE_SEARCH_COUNT}:{query}", True)
+            data = extract_ytdl_info(f"{search_source}{ONLINE_SEARCH_COUNT}:{query}", True)
         except Exception as e:
-            print(f"[Online Search Error] {e}")
+            print(f"[{search_source} Search Error] {e}")
             return []
 
         if not isinstance(data, dict):
@@ -294,7 +305,16 @@ class Music(commands.Cog):
             raw_entries = list(data.get("entries") or [])
         else:
             raw_entries = [data]
-        return [entry for entry in raw_entries if isinstance(entry, dict)][:ONLINE_SEARCH_COUNT]
+
+        entries = []
+        for entry in raw_entries:
+            if isinstance(entry, dict):
+                entry_with_source = dict(entry)
+                entry_with_source["_search_source"] = search_source
+                entries.append(entry_with_source)
+            if len(entries) >= ONLINE_SEARCH_COUNT:
+                break
+        return entries
 
     def build_track_choices(
         self,
@@ -323,11 +343,13 @@ class Music(commands.Cog):
             seen_paths.add(path)
 
         local_choices.sort(key=lambda choice: (-choice.score, choice.title.lower(), choice.local_path or ""))
+        if local_choices:
+            return local_choices[:MAX_LOCAL_CHOICES]
 
         online_choices: List[TrackChoice] = []
         seen_urls = set()
         for entry in online_entries:
-            url = online_entry_url(entry)
+            url = online_entry_url(entry, str(entry.get("_search_source") or "ytsearch"))
             if not url or url in seen_urls:
                 continue
             title = str(entry.get("title") or entry.get("name") or "Unknown Title")
@@ -342,22 +364,33 @@ class Music(commands.Cog):
             ))
             seen_urls.add(url)
 
-        return (local_choices[:MAX_LOCAL_CHOICES] + online_choices[:ONLINE_SEARCH_COUNT])[:MAX_TRACK_CHOICES]
+        return online_choices[:MAX_TRACK_CHOICES]
 
     async def find_track_choices(self, query: str) -> List[TrackChoice]:
         clean_query = query.strip()
+        try:
+            local_matches = await asyncio.to_thread(self._search_local_matches, clean_query)
+        except Exception as e:
+            print(f"[Local Search Task Error] {e}")
+            local_matches = []
+
+        # Local matches take precedence. Do not mix online tracks into a local result list.
+        local_choices = self.build_track_choices(clean_query, local_matches, [])
+        if local_choices:
+            return local_choices
+
         results = await asyncio.gather(
-            asyncio.to_thread(self._search_local_matches, clean_query),
-            asyncio.to_thread(self._search_online_entries, clean_query),
+            asyncio.to_thread(self._search_online_entries, clean_query, "ytsearch"),
+            asyncio.to_thread(self._search_online_entries, clean_query, "scsearch"),
             return_exceptions=True
         )
-        local_matches = results[0] if not isinstance(results[0], Exception) else []
-        online_entries = results[1] if not isinstance(results[1], Exception) else []
-        if isinstance(results[0], Exception):
-            print(f"[Local Search Task Error] {results[0]}")
-        if isinstance(results[1], Exception):
-            print(f"[Online Search Task Error] {results[1]}")
-        return self.build_track_choices(clean_query, local_matches, online_entries)
+        online_entries = []
+        for source, result in zip(("ytsearch", "scsearch"), results):
+            if isinstance(result, Exception):
+                print(f"[{source} Search Task Error] {result}")
+            else:
+                online_entries.extend(result)
+        return self.build_track_choices(clean_query, [], online_entries)
 
     @staticmethod
     def _song_from_extracted_data(
@@ -461,7 +494,9 @@ class Music(commands.Cog):
             inline=False
         )
         embed.set_footer(
-            text=f"Showing {len(choices)} closest local and YouTube matches. Use a more specific search to narrow the list."
+            text=(
+                f"Showing {len(choices)} local matches first; YouTube and SoundCloud are searched only when no local tracks match."
+            )
         )
         return embed
 

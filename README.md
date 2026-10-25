@@ -64,7 +64,7 @@ PermBot searches these files before falling back to online extraction. Supported
 
 ### Choosing between similar tracks
 
-When `!play`, `/play`, `!playnext`, or `/playnext` finds multiple local or YouTube tracks with the same or a similar name, the bot shows a numbered list and a dropdown with the title, artist/channel, duration, and source. The requester picks the intended version; the menu also has a Cancel button and expires after 60 seconds. Direct links play immediately without the selection menu.
+When `!play`, `/play`, `!playnext`, or `/playnext` finds multiple local tracks with the same or a similar name, the bot shows only those local files as choices. If there are no local matches, it searches YouTube and SoundCloud and offers those results instead. The requester picks from a dropdown with the title, artist/channel, duration, and source; the menu also has a Cancel button and expires after 60 seconds. Direct links play immediately without the selection menu.
 
 To preview standardized filenames without changing anything:
 
