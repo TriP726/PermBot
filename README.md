@@ -70,6 +70,16 @@ py -3.14 tools\clean_music.py "D:\Music"
 
 Add `--apply` only after reviewing the dry-run output.
 
+## Translation
+
+Discord does not let a slash command be sent as a reply, so translation has three entry points:
+
+- Reply to a message with `!translate <language>` (alias `!tr`), for example `!translate spanish`.
+- Right-click a message and choose **Apps → Translate**. The result is private, starts in your Discord language, and has a dropdown to switch.
+- `/translate <language> [text]` translates the latest message in the channel, or `text` if you supply it.
+
+Languages can be names or codes (`japanese`, `fr`, `zh-TW`). Translations come from Google Translate's keyless web endpoint, so no API key is needed, but it is an unofficial service that can rate limit or change without notice. The bot needs **Read Message History** in channels where it is used.
+
 ## Runtime data and backups
 
 Guild configuration and user state are written to `data/*.json`. Those files are deployment-specific and ignored by Git. The backup cog writes snapshots to `backups/`; see [docs/BACKUP_RESTORE.md](docs/BACKUP_RESTORE.md) before restoring one.

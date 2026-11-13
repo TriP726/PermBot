@@ -127,6 +127,7 @@ HELP_CATEGORIES: Dict[str, Dict[str, Any]] = {
             ("!serverinfo / /serverinfo", "Display guild statistics, member count, boost level, and features."),
             ("!avatar / /avatar [@user]", "Display high-resolution avatar of a member."),
             ("!qrcode / /qrcode <text_or_url>", "Generate a dynamic scannable QR code image."),
+            ("!translate / /translate <language> [text]", "Translate the message you replied to (or the latest message, or your own text). Also on right-click → Apps → Translate."),
             ("!poll / /poll <question> | <opt1> | <opt2>", "Create an interactive reaction-based poll.")
         ]
     },
