@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils.helpers import log
+from utils.speech import MAX_AUDIO_SECONDS, SpeechError, SpeechTranscriber
 
 # ==========================================
 # TRANSLATION SERVICE
@@ -25,7 +26,12 @@ REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 MAX_ENCODED_CHUNK = 6000
 
 EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_LIMIT = 1024
 HISTORY_SCAN_LIMIT = 20
+
+# Voice messages and audio attachments are transcribed locally, then translated like text.
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+AUDIO_EXTENSIONS = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma", ".webm")
 
 
 class TranslationError(Exception):
@@ -217,22 +223,49 @@ def extract_text(message: discord.Message) -> str:
     return "\n\n".join(parts)
 
 
+def find_audio(message: discord.Message, voice_only: bool = False) -> Optional[discord.Attachment]:
+    """The voice message on a message (or on a forward), or failing that an audio attachment."""
+    attachments: List[discord.Attachment] = list(message.attachments)
+    for snapshot in getattr(message, "message_snapshots", None) or []:
+        attachments.extend(getattr(snapshot, "attachments", None) or [])
+
+    for attachment in attachments:
+        if attachment.is_voice_message():
+            return attachment
+    if voice_only:
+        return None
+
+    for attachment in attachments:
+        content_type = (attachment.content_type or "").lower()
+        if content_type.startswith("audio/"):
+            return attachment
+        if not content_type and attachment.filename.lower().endswith(AUDIO_EXTENSIONS):
+            return attachment
+    return None
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def build_translation_embed(
     translated: str,
     source_code: str,
     target_code: str,
     source_message: Optional[discord.Message] = None,
     requester: Optional[discord.abc.User] = None,
+    heard: Optional[str] = None,
 ) -> discord.Embed:
-    if len(translated) > EMBED_DESCRIPTION_LIMIT:
-        translated = translated[:EMBED_DESCRIPTION_LIMIT - 1] + "…"
-
-    embed = discord.Embed(description=translated, color=discord.Color.blue())
+    embed = discord.Embed(description=_truncate(translated, EMBED_DESCRIPTION_LIMIT), color=discord.Color.blue())
     if source_message is not None:
         author = source_message.author
         embed.set_author(name=author.display_name, icon_url=author.display_avatar.url)
     else:
         embed.title = "🌐 Translation"
+
+    # For audio, show what was heard so a wrong transcription is easy to spot.
+    if heard and heard.strip() != translated.strip():
+        embed.add_field(name="🎙️ Heard", value=_truncate(heard, EMBED_FIELD_LIMIT), inline=False)
 
     footer = f"{language_name(source_code)} → {language_name(target_code)}"
     if requester is not None:
@@ -273,17 +306,25 @@ class LanguageSelect(discord.ui.Select):
 
         for option in self.options:
             option.default = option.value == target
-        embed = build_translation_embed(translated, source, target, view.source_message)
+        embed = build_translation_embed(translated, source, target, view.source_message, heard=view.heard)
         await interaction.edit_original_response(embed=embed, view=view)
 
 
 class LanguagePickerView(discord.ui.View):
     """Shown under a right-click translation so the user can switch the target language."""
 
-    def __init__(self, cog: "Translate", text: str, source_message: discord.Message, current: str):
+    def __init__(
+        self,
+        cog: "Translate",
+        text: str,
+        source_message: discord.Message,
+        current: str,
+        heard: Optional[str] = None,
+    ):
         super().__init__(timeout=600)
         self.cog = cog
         self.text = text
+        self.heard = heard
         self.source_message = source_message
         self.message: Optional[discord.Message] = None
         self.add_item(LanguageSelect(current))
@@ -303,11 +344,13 @@ class LanguagePickerView(discord.ui.View):
 # ==========================================
 
 class Translate(commands.Cog):
-    """Message translation by reply, slash command, or the right-click Apps menu."""
+    """Text and voice message translation by reply, slash command, or the right-click Apps menu."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.http_session: Optional[aiohttp.ClientSession] = None
+        self.transcriber = SpeechTranscriber()
+        self._prefetch_task: Optional[asyncio.Task] = None
 
         # Slash commands cannot be sent as a reply, so the right-click menu is the
         # slash-style way to point at one exact message.
@@ -316,9 +359,13 @@ class Translate(commands.Cog):
 
     async def cog_load(self) -> None:
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        # Fetch the speech model in the background so the first voice message is not slow.
+        self._prefetch_task = asyncio.create_task(self.transcriber.prefetch())
 
     async def cog_unload(self) -> None:
         self.bot.tree.remove_command(self.context_menu.name, type=self.context_menu.type)
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
 
@@ -376,6 +423,29 @@ class Translate(commands.Cog):
         return "".join(parts), detected
 
     # ------------------------------------------------------------------
+    # Voice Messages
+    # ------------------------------------------------------------------
+    async def transcribe_attachment(self, attachment: discord.Attachment) -> str:
+        """Speech-to-text for a voice message or audio attachment."""
+        limit = f"{MAX_AUDIO_SECONDS // 60} minutes"
+        duration = getattr(attachment, "duration", None)
+        if duration and duration > MAX_AUDIO_SECONDS:
+            raise TranslationError(f"That voice message is too long. I can translate up to {limit} of audio.")
+        if attachment.size > MAX_AUDIO_BYTES:
+            raise TranslationError(f"That audio file is too large. I can translate up to {limit} of audio.")
+
+        try:
+            data = await attachment.read()
+        except discord.HTTPException:
+            raise TranslationError("I could not download that audio from Discord. Try again shortly.")
+
+        try:
+            transcript = await self.transcriber.transcribe(data)
+        except SpeechError as e:
+            raise TranslationError(str(e))
+        return transcript.text
+
+    # ------------------------------------------------------------------
     # Source Message Lookup
     # ------------------------------------------------------------------
     async def _replied_message(self, ctx: commands.Context) -> Optional[discord.Message]:
@@ -400,7 +470,7 @@ class Translate(commands.Cog):
                 # Skipping the bot's own posts keeps repeated use from re-translating a translation.
                 if candidate.author.id == self.bot.user.id:
                     continue
-                if extract_text(candidate):
+                if extract_text(candidate) or find_audio(candidate, voice_only=True):
                     return candidate
         except discord.HTTPException:
             raise TranslationError("I could not read this channel's recent messages. I need **Read Message History** here.")
@@ -412,7 +482,7 @@ class Translate(commands.Cog):
     @commands.hybrid_command(
         name="translate",
         aliases=["tr"],
-        description="Translate the message you replied to, the latest message, or your own text."
+        description="Translate the message or voice message you replied to, the latest message, or your own text."
     )
     @app_commands.describe(
         language="Language to translate into (name or code, e.g. Spanish or es)",
@@ -439,6 +509,8 @@ class Translate(commands.Cog):
             )
 
         source_message: Optional[discord.Message] = None
+        audio: Optional[discord.Attachment] = None
+        heard: Optional[str] = None
         try:
             if text is None:
                 source_message = await self._replied_message(ctx) or await self._latest_message(ctx)
@@ -450,15 +522,19 @@ class Translate(commands.Cog):
                     )
                 text = extract_text(source_message)
                 if not text:
-                    return await ctx.send("❌ That message has no text to translate.", ephemeral=ephemeral)
+                    audio = find_audio(source_message)
+                    if audio is None:
+                        return await ctx.send("❌ That message has no text or voice message to translate.", ephemeral=ephemeral)
 
             # Shows "typing" for prefix use and defers the response for slash use.
             async with ctx.typing():
+                if audio is not None:
+                    text = heard = await self.transcribe_attachment(audio)
                 translated, source = await self.translate_text(text, target)
         except TranslationError as e:
             return await ctx.send(f"❌ {e}", ephemeral=ephemeral)
 
-        embed = build_translation_embed(translated, source, target, source_message, ctx.author)
+        embed = build_translation_embed(translated, source, target, source_message, ctx.author, heard=heard)
         if source_message is None:
             return await ctx.send(embed=embed)
 
@@ -495,21 +571,27 @@ class Translate(commands.Cog):
 
     async def translate_message_menu(self, interaction: discord.Interaction, message: discord.Message):
         text = extract_text(message)
-        if not text:
-            return await interaction.response.send_message("❌ That message has no text to translate.", ephemeral=True)
+        audio = None if text else find_audio(message)
+        if not text and audio is None:
+            return await interaction.response.send_message(
+                "❌ That message has no text or voice message to translate.", ephemeral=True
+            )
 
         # Context menus take no arguments, so start with the user's own Discord language
         # and offer a dropdown to switch.
         target = locale_to_language(interaction.locale)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        heard: Optional[str] = None
         try:
+            if audio is not None:
+                text = heard = await self.transcribe_attachment(audio)
             translated, source = await self.translate_text(text, target)
         except TranslationError as e:
             return await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
-        view = LanguagePickerView(self, text, message, target)
-        embed = build_translation_embed(translated, source, target, message)
+        view = LanguagePickerView(self, text, message, target, heard=heard)
+        embed = build_translation_embed(translated, source, target, message, heard=heard)
         view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
 
 

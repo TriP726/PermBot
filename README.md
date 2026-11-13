@@ -80,6 +80,14 @@ Discord does not let a slash command be sent as a reply, so translation has thre
 
 Languages can be names or codes (`japanese`, `fr`, `zh-TW`). Translations come from Google Translate's keyless web endpoint, so no API key is needed, but it is an unofficial service that can rate limit or change without notice. The bot needs **Read Message History** in channels where it is used.
 
+### Voice messages
+
+The same three entry points work on voice messages and audio attachments up to 5 minutes long. The audio is transcribed on the bot's own machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), which detects the spoken language, and the transcript is then translated. The reply shows both the translation and what was heard.
+
+- `faster-whisper` is installed by `requirements.txt`. Without it the bot still runs and translates text; voice requests get a "not installed" message.
+- The speech model (`small`, about 500 MB) is downloaded once from Hugging Face when the bot starts, and is loaded into memory (roughly 1 GB) on the first voice translation.
+- Transcription uses the CPU and handles one request at a time. Set `WHISPER_MODEL=base` in `.env` for a lighter, less accurate model, or `medium` for a heavier, more accurate one.
+
 ## Runtime data and backups
 
 Guild configuration and user state are written to `data/*.json`. Those files are deployment-specific and ignored by Git. The backup cog writes snapshots to `backups/`; see [docs/BACKUP_RESTORE.md](docs/BACKUP_RESTORE.md) before restoring one.

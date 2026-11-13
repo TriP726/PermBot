@@ -4,3 +4,5 @@ aiohttp>=3.11.0,<4.0.0
 mutagen>=1.47.0,<2.0.0
 psutil>=6.0.0,<8.0.0
 yt-dlp>=2026.1.1
+# Local speech-to-text for voice message translation (optional; the bot runs without it)
+faster-whisper>=1.1.0,<2.0.0
